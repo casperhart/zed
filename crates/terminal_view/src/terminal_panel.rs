@@ -490,7 +490,7 @@ impl TerminalPanel {
                 .detach_and_log_err(cx);
             return;
         }
-        let (existing_item_index, existing_terminal) = terminals_for_task
+        let (existing_pane_index, existing_item_index, existing_terminal) = terminals_for_task
             .last()
             .expect("covered no terminals case above")
             .clone();
@@ -499,7 +499,13 @@ impl TerminalPanel {
                 !use_new_terminal,
                 "Should have handled 'allow_concurrent_runs && use_new_terminal' case above"
             );
-            self.replace_terminal(spawn_task, existing_item_index, existing_terminal, cx);
+            self.replace_terminal(
+                spawn_task,
+                existing_pane_index,
+                existing_item_index,
+                existing_terminal,
+                cx,
+            );
         } else {
             self.deferred_tasks.insert(
                 spawn_in_terminal.id.clone(),
@@ -514,6 +520,7 @@ impl TerminalPanel {
                             } else {
                                 terminal_panel.replace_terminal(
                                     spawn_task,
+                                    existing_pane_index,
                                     existing_item_index,
                                     existing_terminal,
                                     cx,
@@ -558,8 +565,9 @@ impl TerminalPanel {
         &self,
         label: &str,
         cx: &mut AppContext,
-    ) -> Vec<(usize, View<TerminalView>)> {
-        self.pane
+    ) -> Vec<(usize, usize, View<TerminalView>)> {
+        let mut terminals: Vec<_> = self
+            .pane
             .read(cx)
             .items()
             .enumerate()
@@ -567,18 +575,54 @@ impl TerminalPanel {
             .filter_map(|(index, terminal_view)| {
                 let task_state = terminal_view.read(cx).terminal().read(cx).task()?;
                 if &task_state.full_label == label {
-                    Some((index, terminal_view))
+                    // 0 index for terminals within the actual terminal pane
+                    Some((0, index, terminal_view))
                 } else {
                     None
                 }
             })
-            .collect()
+            .collect();
+        if let Some(workspace) = self.workspace.upgrade() {
+            for (pane_index, pane) in workspace.read(cx).panes().iter().enumerate() {
+                terminals.extend(
+                    pane.read(cx)
+                        .items()
+                        .enumerate()
+                        .filter_map(|(index, item)| Some((index, item.act_as::<TerminalView>(cx)?)))
+                        .filter_map(|(view_index, terminal_view)| {
+                            let task_state = terminal_view.read(cx).terminal().read(cx).task()?;
+                            if &task_state.full_label == label {
+                                Some((pane_index + 1, view_index, terminal_view))
+                            } else {
+                                None
+                            }
+                        }),
+                );
+            }
+        }
+        terminals
     }
 
-    fn activate_terminal_view(&self, item_index: usize, focus: bool, cx: &mut WindowContext) {
-        self.pane.update(cx, |pane, cx| {
-            pane.activate_item(item_index, true, focus, cx)
-        })
+    fn activate_terminal_view(
+        &self,
+        pane_index: usize,
+        item_index: usize,
+        focus: bool,
+        cx: &mut WindowContext,
+    ) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            if pane_index == 0 {
+                self.pane.update(cx, |pane, cx| {
+                    pane.activate_item(item_index, true, focus, cx)
+                })
+            } else {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.panes()[pane_index - 1].update(cx, |pane, cx| {
+                        pane.activate_item(item_index, true, focus, cx)
+                    })
+                })
+            }
+        }
     }
 
     fn add_terminal(
@@ -682,6 +726,7 @@ impl TerminalPanel {
     fn replace_terminal(
         &self,
         spawn_task: SpawnInTerminal,
+        terminal_pane_index: usize,
         terminal_item_index: usize,
         terminal_to_replace: View<TerminalView>,
         cx: &mut ViewContext<'_, Self>,
@@ -704,7 +749,7 @@ impl TerminalPanel {
 
         match reveal {
             RevealStrategy::Always => {
-                self.activate_terminal_view(terminal_item_index, true, cx);
+                self.activate_terminal_view(terminal_pane_index, terminal_item_index, true, cx);
                 let task_workspace = self.workspace.clone();
                 cx.spawn(|_, mut cx| async move {
                     task_workspace
@@ -714,7 +759,7 @@ impl TerminalPanel {
                 .detach();
             }
             RevealStrategy::NoFocus => {
-                self.activate_terminal_view(terminal_item_index, false, cx);
+                self.activate_terminal_view(terminal_pane_index, terminal_item_index, false, cx);
                 let task_workspace = self.workspace.clone();
                 cx.spawn(|_, mut cx| async move {
                     task_workspace
@@ -739,10 +784,10 @@ impl TerminalPanel {
 }
 
 async fn wait_for_terminals_tasks(
-    terminals_for_task: Vec<(usize, View<TerminalView>)>,
+    terminals_for_task: Vec<(usize, usize, View<TerminalView>)>,
     cx: &mut AsyncWindowContext,
 ) {
-    let pending_tasks = terminals_for_task.iter().filter_map(|(_, terminal)| {
+    let pending_tasks = terminals_for_task.iter().filter_map(|(_, _, terminal)| {
         terminal
             .update(cx, |terminal_view, cx| {
                 terminal_view
